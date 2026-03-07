@@ -42,8 +42,7 @@ def _group_gemm_kernel(
         loaded = T.alloc_barrier([32] * num_stages)
         consumed = T.alloc_barrier([1] * num_stages)
         tmem_full = T.alloc_barrier([1])
-
-        T.use_swizzle(8)
+        local_pid_m = T.alloc_var(T.int32)
 
         eid = pid_m_to_eid[pid_m]
         local_pid_m = pid_m_to_local[pid_m]
@@ -51,55 +50,64 @@ def _group_gemm_kernel(
 
         start_m = offsets[eid]
         end_m = offsets[eid + 1]
+
+        group_size_m = 8
+        num_pid_m = (end_m - start_m + block_M - 1) // block_M
+        linear_id = local_pid_m * n_blocks + pid_n
+        num_pid_in_group = group_size_m * n_blocks
+        group_id = linear_id // num_pid_in_group
+        first_pid_m = group_id * group_size_m
+        group_m = T.min(num_pid_m - first_pid_m, group_size_m)
+        local_pid_m = first_pid_m + (linear_id % num_pid_in_group) % group_m
+        pid_n = (linear_id % num_pid_in_group) // group_m
+
         tile_m = start_m + local_pid_m * block_M
 
-        if tile_m < end_m:
+        if tx < 32:  # warp 0: stage tiles into shared memory
+            for k in T.serial(k_blocks):
+                stage = k % num_stages
+                T.mbarrier_wait_parity(consumed[stage], ((k // num_stages) & 1) ^ 1)
+                T.copy(
+                    A[tile_m : tile_m + block_M, k * block_K : (k + 1) * block_K],
+                    A_shared[stage, :, :],
+                )
+                T.copy(
+                    B[eid, pid_n * block_N : (pid_n + 1) * block_N, k * block_K : (k + 1) * block_K],
+                    B_shared[stage, :, :],
+                )
+                T.mbarrier_arrive(loaded[stage])
+        elif tx < 64:  # warp 1: issue tcgen5 mma
+            for k in T.serial(k_blocks):
+                stage = k % num_stages
+                T.mbarrier_wait_parity(loaded[stage], (k // num_stages) & 1)
+                T.gemm(
+                    A_shared[stage, :, :],
+                    B_shared[stage, :, :],
+                    C_tmem,
+                    mbar=consumed[stage],
+                    transpose_B=True,
+                    wg_wait=-1,
+                    clear_accum=k == 0,
+                )
+            T.tcgen05_mma_arrive(tmem_full) 
 
-            if tx < 32:  # warp 0: stage tiles into shared memory
-                for k in T.serial(k_blocks):
-                    stage = k % num_stages
-                    T.mbarrier_wait_parity(consumed[stage], ((k // num_stages) & 1) ^ 1)
-                    T.copy(
-                        A[tile_m : tile_m + block_M, k * block_K : (k + 1) * block_K],
-                        A_shared[stage, :, :],
-                    )
-                    T.copy(
-                        B[eid, pid_n * block_N : (pid_n + 1) * block_N, k * block_K : (k + 1) * block_K],
-                        B_shared[stage, :, :],
-                    )
-                    T.mbarrier_arrive(loaded[stage])
-            elif tx < 64:  # warp 1: issue tcgen5 mma
-                for k in T.serial(k_blocks):
-                    stage = k % num_stages
-                    T.mbarrier_wait_parity(loaded[stage], (k // num_stages) & 1)
-                    T.gemm(
-                        A_shared[stage, :, :],
-                        B_shared[stage, :, :],
-                        C_tmem,
-                        mbar=consumed[stage],
-                        transpose_B=True,
-                        wg_wait=-1,
-                        clear_accum=k == 0,
-                    )
-                T.tcgen05_mma_arrive(tmem_full) 
-
-            # Wait for tcgen5 mma completion before reading C_tmem.
-            T.mbarrier_wait_parity(tmem_full, 0)
-            T.sync_threads()
-            T.copy(C_tmem, C_local)
-            if tile_m + block_M <= end_m:
-                if use_tma_store:
-                    T.copy(C_local, C_shared)
-                    T.copy(C_shared, C[tile_m, pid_n * block_N])
-                else:
-                    T.copy(C_local, C_local_cast)
-                    T.copy(C_local_cast, C[tile_m, pid_n * block_N])
+        # Wait for tcgen5 mma completion before reading C_tmem.
+        T.mbarrier_wait_parity(tmem_full, 0)
+        T.sync_threads()
+        T.copy(C_tmem, C_local)
+        if tile_m + block_M <= end_m:
+            if use_tma_store:
+                T.copy(C_local, C_shared)
+                T.copy(C_shared, C[tile_m, pid_n * block_N])
             else:
                 T.copy(C_local, C_local_cast)
-                actual_rows = end_m - tile_m
-                for i, j in T.Parallel(block_M, block_N):
-                    if i < actual_rows and pid_n * block_N + j < N:
-                        C[tile_m + i, pid_n * block_N + j] = C_local_cast[i, j]
+                T.copy(C_local_cast, C[tile_m, pid_n * block_N])
+        else:
+            T.copy(C_local, C_local_cast)
+            actual_rows = end_m - tile_m
+            for i, j in T.Parallel(block_M, block_N):
+                if i < actual_rows and pid_n * block_N + j < N:
+                    C[tile_m + i, pid_n * block_N + j] = C_local_cast[i, j]
 
     return C
 
@@ -117,11 +125,9 @@ def group_gemm(
     expert_m_blocks = (cnt[1:] - cnt[:-1] + block_M - 1) // block_M
     eid_base = torch.arange(expert_m_blocks.numel(), device=cnt.device, dtype=torch.int32)
     pid_m_to_eid = torch.repeat_interleave(eid_base, expert_m_blocks)
-    local_block_chunks = [
-        torch.arange(int(b.item()), device=cnt.device, dtype=torch.int32)
-        for b in expert_m_blocks
-    ]
-    pid_m_to_local = torch.cat(local_block_chunks)
+    block_cumsum = torch.zeros(eid_base.numel() + 1, device=cnt.device, dtype=torch.int32)
+    block_cumsum[1:] = expert_m_blocks.cumsum(0)
+    pid_m_to_local = torch.arange(pid_m_to_eid.numel(), device=cnt.device, dtype=torch.int32) - block_cumsum[pid_m_to_eid]
 
     return _group_gemm_kernel(
         A, B, cnt, pid_m_to_eid, pid_m_to_local,
@@ -133,13 +139,13 @@ def group_gemm(
 def main():
     from examples.grouped_gemm_sm100.group_gemm import Mgemm as triton_Mgemm
 
-    E = 8
-    N, K = 1024, 3072
+    E = 16
+    N, K = 1024, 4096
     tokens_per_expert = 4096
     M_total = E * tokens_per_expert
 
     tokens_per_expert_vec = torch.full((E,), tokens_per_expert, dtype=torch.int32, device="cuda")
-    offsets = torch.tensor([-3, -2, -1, 0, 1, 2, 3, 0], dtype=torch.int32, device="cuda")
+    offsets = torch.tensor([-3, -2, -1, 0, 1, 2, 3, 0, -3, -2, -1, 0, 1, 2, 3, 0], dtype=torch.int32, device="cuda")
     tokens_per_expert_vec = tokens_per_expert_vec + offsets
     tokens_per_expert_vec[-1] = tokens_per_expert_vec[-1] - offsets.sum()
 
