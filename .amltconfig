@@ -1,0 +1,1 @@
+{"project_name": "llm_new", "storage_account_name": "conversationhub", "container_name": "amlt-jobs", "blob_storage_account_name": "conversationhub", "registry_name": "projects", "local_path": "/home/t-yutaosun/tilelang", "default_output_dir": "/home/t-yutaosun/tilelang/amlt", "project_uuid": "7256333427.94770-9db5c132-949c-4e4b-ae5d-1ec64698fe55", "version": "10.28.1"}

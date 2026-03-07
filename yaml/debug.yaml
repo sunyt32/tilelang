@@ -1,0 +1,63 @@
+description: llm
+
+target:
+  service: volcano
+  name: oidc@msr02
+  queue: bonete01
+ 
+environment:
+  image: sunyt32/pytorch:25.12.13-py3
+  setup:
+  - apt-get update && apt-get install -y libarchive-dev
+  - pip install blobfile tiktoken wandb numpy tensorboard libarchive-c
+  - echo "torch==2.10.0.dev20251213+cu130" > constraints.txt && pip install "git+https://github.com/Dao-AILab/flash-attention.git@fec3a6a18460c1b40f097208d4c16fe8964a679d#subdirectory=flash_attn/cute" -c constraints.txt
+
+
+code:
+  local_dir: $CONFIG_DIR/..
+
+storage:
+  msranlp:
+    storage_account_name: msranlp
+    container_name: unilm
+  nlcredstone:
+    storage_account_name: nlcredstone
+    container_name: unilm
+  msranlphot:
+    storage_account_name: msranlphot
+    container_name: data
+  conversationhubhot:
+    storage_account_name: conversationhubhot
+    container_name: unilm
+  conversationhubcacentral:
+    storage_account_name: conversationhubcacentral
+    container_name: data
+  output:
+    storage_account_name: msranlphot
+    container_name: wangliang
+
+search:
+  job_template:
+    name: t_{model}
+    identity: managed
+    # priority: high
+    submit_args:
+      env:
+        AMLT_PERSISTENT_VOLUME_NAME: "pvc-vast-bonete01"
+        AMLT_PERSISTENT_VOLUME_MOUNT_DIR: /mnt/pvc
+    sku: 1xG4
+    sla_tier: premium
+    mpi: False
+    process_count_per_node: 1
+    command:
+    - env
+    - export PATH=/home/aiscuser/.local/bin:$$PATH
+    - export WANDB_NAME={model}
+    - export MASTER_ADDR=$$(cat /etc/volcano/master.host)
+    - sleep infinity
+  type: grid
+  max_trials: 500
+  params:
+    - name: model
+      spec: discrete
+      values: ["Debug"]
